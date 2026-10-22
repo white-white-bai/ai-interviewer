@@ -24,8 +24,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from app import llm
-from app.interview.prompts import EVALUATE_PROMPT, QUESTION_PROMPT, SUMMARY_PROMPT
+from app.interview.prompts import (
+    EVALUATE_PROMPT,
+    QUESTION_WITH_TOOLS_PROMPT,
+    SUMMARY_PROMPT,
+)
 from app.interview.schemas import EvaluationResult, NextAction, QAItem
+from app.interview.tools import TOOLS, execute_tool
 from app.interview.service import _clean_json
 
 # 检查点数据库：LangGraph 每个步骤都会把状态快照写进这个文件
@@ -68,25 +73,50 @@ def _format_history(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# Agent 循环最大工具轮数：防止模型无限调工具烧钱（成本熔断雏形，M11 系统化）
+MAX_TOOL_ROUNDS = 3
+
+
 def generate_question(state: InterviewGraphState) -> dict:
-    """出题节点：根据岗位 + 历史问答生成下一道面试题
+    """出题节点（M3-b 升级为 Agent 循环）：LLM 可先查题库再出题
+
+    Agent 循环（function calling 标准套路）：
+    1. 工具声明随消息发给模型
+    2. 模型要么直接给出问题文本（循环结束），要么返回 tool_calls
+    3. 执行工具，结果以 role=tool 消息回填，回到第 1 步
 
     出题用高温度（0.8），鼓励发散覆盖更多知识点。
-    返回 dict 是"增量更新"：LangGraph 会把它合并进共享状态。
     """
-    question = llm.chat(
-        messages=[{
-            "role": "user",
-            "content": QUESTION_PROMPT.format(
-                position=state["position"],
-                candidate_name=state["candidate_name"],
-                history_text=_format_history(state.get("history", [])),
-            ),
-        }],
-        temperature=0.8,
+    user_content = QUESTION_WITH_TOOLS_PROMPT.format(
+        position=state["position"],
+        candidate_name=state["candidate_name"],
+        history_text=_format_history(state.get("history", [])),
     )
+    messages: list = [{"role": "user", "content": user_content}]
+    question = ""
+    for _ in range(MAX_TOOL_ROUNDS):
+        message = llm.chat_with_tools(messages, tools=TOOLS, temperature=0.8)
+        if not message.tool_calls:
+            # 模型不再要工具了：message.content 就是最终问题
+            question = (message.content or "").strip()
+            break
+        # 协议要求：先把 assistant 的 tool_calls 消息入列，再回填对应结果
+        messages.append(message)
+        for call in message.tool_calls:
+            # print 是教学期的轨迹观察手段，M10 会换成正式的轨迹记录
+            print(f"[工具调用] {call.function.name}({call.function.arguments})")
+            result = execute_tool(call.function.name, call.function.arguments)
+            print(f"[工具结果] {result[:200]}")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,  # 结果必须与请求一一对应
+                "content": result,
+            })
+    if not question:
+        # 兜底：达到工具轮数上限仍没拿到最终问题，撤掉工具声明直接要答案
+        question = llm.chat(messages=[messages[0]], temperature=0.8).strip()
     return {
-        "current_question": question.strip(),
+        "current_question": question,
         "round_count": state.get("round_count", 0) + 1,
     }
 

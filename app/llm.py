@@ -30,3 +30,21 @@ def chat(messages: list[dict], temperature: float = 0.7) -> str:
     )
     # 取第一个候选的回复内容
     return response.choices[0].message.content
+
+
+def chat_with_tools(messages: list, tools: list, temperature: float = 0.7):
+    """带工具声明的对话调用，返回完整的 assistant 消息对象
+
+    与 chat() 的区别：模型可能不直接回答，而是返回带 tool_calls 的消息
+    （想调用哪个工具、传什么参数）。调用方需要执行工具、把结果以
+    role=tool 消息回填进 messages 再次调用——这就是 Agent 循环。
+    """
+    client = get_llm_client()
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        tools=tools,
+        temperature=temperature,
+    )
+    # 返回完整消息对象：含 content / tool_calls / role 等字段
+    return response.choices[0].message
