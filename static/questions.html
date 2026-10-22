@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<!-- M12 前端：题库管理页（零构建：原生 HTML + CSS + JS）
+     对接接口：GET /questions（分页）、GET /questions/search、POST /questions、PUT /questions/{id}、DELETE /questions/{id} -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>题库管理 · AI 面试官</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", system-ui, sans-serif; background: #f0f2f5; color: #1f2329; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #86909c; font-size: 13px; margin-bottom: 20px; }
+  .sub a { color: #3370ff; text-decoration: none; }
+  .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(31,35,41,.08); }
+  .card h2 { font-size: 16px; margin-bottom: 12px; }
+  label { display: block; font-size: 13px; color: #4e5969; margin: 10px 0 4px; }
+  input { width: 100%; border: 1px solid #d4d7dc; border-radius: 6px; padding: 9px 12px; font-size: 14px; }
+  input:focus { outline: none; border-color: #3370ff; }
+  button { border: none; border-radius: 6px; padding: 9px 20px; font-size: 14px; cursor: pointer; background: #3370ff; color: #fff; }
+  button:hover { background: #2860e1; }
+  button:disabled { background: #a9c4ff; cursor: not-allowed; }
+  button.ghost { background: #f2f3f5; color: #1f2329; }
+  button.ghost:hover { background: #e5e6eb; }
+  button.danger { background: #f53f3f; }
+  button.danger:hover { background: #d92d2d; }
+  button.small { padding: 5px 12px; font-size: 13px; }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .grid2 { display: grid; grid-template-columns: 1fr 200px; gap: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #f0f2f5; vertical-align: top; }
+  th { color: #86909c; font-weight: 500; font-size: 13px; }
+  td.title { line-height: 1.5; }
+  .cat { display: inline-block; background: #e8f3ff; color: #3370ff; font-size: 12px; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
+  .pager { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 14px; font-size: 13px; color: #4e5969; }
+  .total { color: #86909c; font-size: 13px; margin-bottom: 8px; }
+  .hidden { display: none; }
+  /* 优先级修正：ID 选择器(#loading)压过 class 选择器(.hidden)，必须用更高特异度才能隐藏遮罩 */
+  #loading.hidden { display: none; }
+  #loading { position: fixed; inset: 0; background: rgba(255,255,255,.72); display: flex; align-items: center; justify-content: center; z-index: 9; }
+  .spinner { width: 34px; height: 34px; border: 3px solid #d4d7dc; border-top-color: #3370ff; border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #toast { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); background: #1f2329; color: #fff; padding: 9px 18px; border-radius: 6px; font-size: 13px; display: none; z-index: 99; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>题库管理</h1>
+  <div class="sub"><a href="/static/index.html">← 返回面试</a></div>
+
+  <!-- 搜索栏：按分类/关键词检索 -->
+  <div class="card">
+    <div class="grid2">
+      <input id="searchKeyword" placeholder="关键词，如 GIL、索引、事务">
+      <input id="searchCategory" placeholder="分类，如 Python">
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button onclick="loadSearch()">搜索</button>
+      <button class="ghost" onclick="resetSearch()">重置</button>
+    </div>
+  </div>
+
+  <!-- 新增题目 -->
+  <div class="card">
+    <h2>新增题目</h2>
+    <label>题目内容（5-200 字）</label>
+    <input id="newTitle" placeholder="如：什么是 Python 的 GIL？它对多线程程序有什么影响？">
+    <label>分类</label>
+    <input id="newCategory" placeholder="如：Python（默认：通用）">
+    <div class="row"><button onclick="createQuestion()">创建</button></div>
+  </div>
+
+  <!-- 题目列表 -->
+  <div class="card">
+    <h2>题目列表</h2>
+    <div class="total" id="totalText"></div>
+    <table>
+      <thead><tr><th style="width:56px">ID</th><th>题目</th><th style="width:96px">分类</th><th style="width:140px">操作</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="pager">
+      <button class="ghost small" id="prevBtn" onclick="loadList(page - 1)">上一页</button>
+      <span id="pageText"></span>
+      <button class="ghost small" id="nextBtn" onclick="loadList(page + 1)">下一页</button>
+    </div>
+  </div>
+</div>
+
+<div id="loading" class="hidden"><div class="spinner"></div></div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+/** 分页状态：SIZE 与后端默认一致；page 为当前页码 */
+const SIZE = 10;
+let page = 1;
+/** 搜索条件快照：搜索后翻页要保持条件 */
+let searchArgs = { category: "", keyword: "" };
+
+/** 通用请求封装：统一 JSON 头、错误提示、加载遮罩 */
+async function api(path, method, body) {
+  document.getElementById("loading").classList.remove("hidden");
+  try {
+    const resp = await fetch(path, {
+      method,
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || JSON.stringify(err));
+    }
+    return resp.status === 204 ? null : await resp.json();
+  } finally { document.getElementById("loading").classList.add("hidden"); }
+}
+
+/** 轻提示（3 秒自动消失） */
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg; el.style.display = "block";
+  setTimeout(() => el.style.display = "none", 3000);
+}
+
+/** HTML 转义：题目内容是用户输入，防 XSS */
+function esc(s) { return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+
+/** 加载列表：有搜索条件走 /search（不分页接口，前端分页），否则走 /questions（后端分页） */
+async function loadList(targetPage) {
+  page = Math.max(1, targetPage || 1);
+  let items, total;
+  if (searchArgs.category || searchArgs.keyword) {
+    const qs = new URLSearchParams({ ...searchArgs, page, size: SIZE });
+    const data = await api("/questions/search?" + qs, "GET");
+    items = data.questions; total = data.total;
+  } else {
+    const data = await api(`/questions?page=${page}&size=${SIZE}`, "GET");
+    items = data.questions; total = data.total;
+  }
+  const maxPage = Math.max(1, Math.ceil(total / SIZE));
+  if (page > maxPage) { page = maxPage; return loadList(page); }
+  document.getElementById("totalText").textContent = `共 ${total} 道${searchArgs.category || searchArgs.keyword ? "（搜索结果）" : ""}`;
+  document.getElementById("pageText").textContent = `${page} / ${maxPage}`;
+  document.getElementById("prevBtn").disabled = page <= 1;
+  document.getElementById("nextBtn").disabled = page >= maxPage;
+  document.getElementById("tbody").innerHTML = items.map(q => `
+    <tr id="row-${q.id}">
+      <td>${q.id}</td>
+      <td class="title" id="title-${q.id}">${esc(q.title)}</td>
+      <td><span class="cat" id="cat-${q.id}">${esc(q.category)}</span></td>
+      <td>
+        <button class="ghost small" onclick="startEdit(${q.id})">编辑</button>
+        <button class="danger small" onclick="deleteQuestion(${q.id})">删除</button>
+      </td>
+    </tr>`).join("");
+}
+
+/** 应用搜索：记录条件并回到第 1 页 */
+function loadSearch() {
+  searchArgs = {
+    keyword: document.getElementById("searchKeyword").value.trim(),
+    category: document.getElementById("searchCategory").value.trim(),
+  };
+  loadList(1);
+}
+
+/** 重置搜索条件，回到全量列表 */
+function resetSearch() {
+  document.getElementById("searchKeyword").value = "";
+  document.getElementById("searchCategory").value = "";
+  searchArgs = { category: "", keyword: "" };
+  loadList(1);
+}
+
+/** 创建题目：POST /questions（201），成功后刷新列表 */
+async function createQuestion() {
+  const title = document.getElementById("newTitle").value.trim();
+  const category = document.getElementById("newCategory").value.trim();
+  if (title.length < 5 || title.length > 200) { toast("题目内容需 5-200 字"); return; }
+  try {
+    await api("/questions", "POST", { title, ...(category ? { category } : {}) });
+    toast("创建成功");
+    document.getElementById("newTitle").value = "";
+    document.getElementById("newCategory").value = "";
+    loadList(1);
+  } catch (e) { toast("创建失败：" + e.message); }
+}
+
+/** 删除题目：确认后 DELETE（204），成功后留在当前页 */
+async function deleteQuestion(id) {
+  if (!confirm(`确认删除题目 #${id}？`)) return;
+  try { await api(`/questions/${id}`, "DELETE"); toast("已删除"); loadList(page); }
+  catch (e) { toast("删除失败：" + e.message); }
+}
+
+/** 行内编辑：把该行题目/分类单元格换成输入框，保存调 PUT（部分更新语义） */
+function startEdit(id) {
+  const titleEl = document.getElementById("title-" + id);
+  const catEl = document.getElementById("cat-" + id);
+  const oldTitle = titleEl.textContent;
+  const oldCat = catEl.textContent;
+  titleEl.innerHTML = `<input value="${esc(oldTitle)}" id="edit-title-${id}">`;
+  catEl.innerHTML = `<input value="${esc(oldCat)}" id="edit-cat-${id}" style="padding:5px">`;
+  titleEl.nextElementSibling.nextElementSibling.innerHTML =
+    `<button class="small" onclick="saveEdit(${id})">保存</button> <button class="ghost small" onclick="loadList(page)">取消</button>`;
+}
+
+/** 保存编辑：PUT /questions/{id}，只传改动的字段（exclude_unset 语义在客户端的对应做法） */
+async function saveEdit(id) {
+  const title = document.getElementById("edit-title-" + id).value.trim();
+  const category = document.getElementById("edit-cat-" + id).value.trim();
+  if (title.length < 5 || title.length > 200) { toast("题目内容需 5-200 字"); return; }
+  try {
+    await api(`/questions/${id}`, "PUT", { title, category });
+    toast("已保存");
+    loadList(page);
+  } catch (e) { toast("保存失败：" + e.message); }
+}
+
+/** 回车触发搜索 */
+document.getElementById("searchKeyword").addEventListener("keydown", e => { if (e.key === "Enter") loadSearch(); });
+document.getElementById("searchCategory").addEventListener("keydown", e => { if (e.key === "Enter") loadSearch(); });
+
+/** 页面加载：默认拉第一页 */
+window.addEventListener("DOMContentLoaded", () => loadList(1));
+</script>
+</body>
+</html>
