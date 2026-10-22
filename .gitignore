@@ -10,3 +10,6 @@ venv/
 # 数据库文件
 *.db
 *.sqlite3
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

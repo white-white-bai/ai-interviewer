@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers import questions
+from app.routers import interview, interview_graph, questions
 
 # 创建 FastAPI 应用实例
 # title/description/version 会展示在自动生成的文档页面上
@@ -13,6 +13,9 @@ app = FastAPI(
 # 挂载路由模块：include_router 把 router 里的所有端点注册进应用
 # 后续新增资源时继续 include（如 users.router、interviews.router）
 app.include_router(questions.router)
+# LangGraph 版路由带固定段 /interview/graph/*，注册在含参数段的 interview 路由之前
+app.include_router(interview_graph.router)
+app.include_router(interview.router)
 
 
 @app.get("/")
