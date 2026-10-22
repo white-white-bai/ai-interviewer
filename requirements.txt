@@ -4,3 +4,4 @@ openai
 python-dotenv
 langgraph
 langgraph-checkpoint-sqlite
+mcp<2
