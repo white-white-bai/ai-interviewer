@@ -69,6 +69,7 @@ def chat_structured(
     model_cls: type[BaseModel],
     temperature: float = 0.3,
     max_retries: int = 2,
+    trace_thread_id: str | None = None,
 ):
     """调用 LLM 并解析成 Pydantic 模型；校验失败把错误回填重试（M9 场景①：自我纠错）
 
@@ -82,6 +83,8 @@ def chat_structured(
         model_cls: 目标 Pydantic 模型类（如 PlannerDirective / EvaluationResult）
         temperature: 采样温度
         max_retries: 校验失败后的最大重试次数（总调用 = 1 + max_retries）
+        trace_thread_id: 轨迹线程 ID（M10）：提供时把每次重试记录进轨迹，
+            供评测脚本断言"重试是否在预算内"；None 表示不记录
 
     Returns:
         model_cls 的校验通过实例
@@ -95,9 +98,18 @@ def chat_structured(
         except ValidationError as exc:
             last_error = exc
             first = exc.errors()[0]
-            # print 是教学期的轨迹观察手段（M10 换正式轨迹记录）：
+            # print 是教学期的轨迹观察手段（M10 换正式的轨迹记录）：
             # 让"自我纠错"发生时可见——第几轮重试、错在哪
             print(f"[自我纠错] 结构化输出解析失败（{first.get('msg')}），回填错误重试（第 {attempt + 1}/{max_retries} 次）")
+            if trace_thread_id:
+                from app.interview import tracing  # 延迟导入避免循环依赖（tracing 不依赖 llm，但保持统一风格）
+                tracing.log_event(
+                    trace_thread_id,
+                    "self_correction",
+                    attempt=attempt + 1,
+                    error=first.get("msg"),
+                    model=model_cls.__name__,
+                )
             # 回填坏输出 + 纠错指令：不悄悄丢弃失败尝试，让模型看到自己错在哪
             convo.append({"role": "assistant", "content": raw})
             convo.append({

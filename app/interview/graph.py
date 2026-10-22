@@ -1,4 +1,4 @@
-"""M2：用 LangGraph 重写面试流程（与 M1 手写状态机 app/interview/state_machine.py 并存对比）
+﻿"""M2：用 LangGraph 重写面试流程（与 M1 手写状态机 app/interview/state_machine.py 并存对比）
 
 M1 的痛点 → M2 的解法：
 - 状态存在内存字典里，重启即丢 → checkpointer 每执行一步自动把完整状态写入 SQLite
@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Annotated, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.runnables import RunnableConfig  # 节点第二参数必须标这个类型，LangGraph 才会注入 config
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -42,15 +43,24 @@ from app.interview.prompts import (
 )
 from app.interview.schemas import EvaluationResult, NextAction, QAItem
 from app.interview.tools import TOOLS, execute_tool, extract_text_tool_calls
+from app.interview import tracing
 from app.security import sanitize_answer
 
 # 检查点数据库：LangGraph 每个步骤都会把状态快照写进这个文件
 # 注意：这是 LangGraph 自己的"存档库"，与 M3 要做的业务数据库是两回事
 _CHECKPOINT_DB = Path(__file__).resolve().parent.parent.parent / "checkpoints.sqlite"
 
-# FastAPI 多线程处理请求，sqlite3 连接必须允许跨线程使用
 _conn = sqlite3.connect(_CHECKPOINT_DB, check_same_thread=False)
 checkpointer = SqliteSaver(_conn)
+
+
+def _tid(config: RunnableConfig | None) -> str:
+    """从 LangGraph 运行配置里取 thread_id（M10 轨迹记录用）
+
+    LangGraph 节点函数的第二参数标注为 RunnableConfig 时自动注入；
+    thread_id 就是我们 make_config 时传的"会话主键"。
+    """
+    return ((config or {}).get("configurable") or {}).get("thread_id", "")
 
 
 class InterviewGraphState(TypedDict):
@@ -101,19 +111,22 @@ def _format_history(history: list[dict]) -> str:
 MAX_TOOL_ROUNDS = 3
 
 
-def plan_topic(state: InterviewGraphState) -> dict:
+def plan_topic(state: InterviewGraphState, config: RunnableConfig) -> dict:
     """考察规划节点（M5 新增）：多 Agent 协作的第一环
 
     规划官读记忆文本（摘要+滑窗），决定下一个考察知识点，
     结果经 Pydantic 校验后写入 state["directive"]——
     Agent 之间不直接对话，图的共享状态就是协作介质。
+
+    M10：规划结果同步落轨迹（评测脚本据此断言"每一题都经规划"）。
     """
-    directive = agents.plan_next_topic(state)
+    directive = agents.plan_next_topic(state, thread_id=_tid(config))
     print(f"[规划官] 下一考点：{directive.topic}（{directive.guidance}）")
+    tracing.log_event(_tid(config), "plan", topic=directive.topic, guidance=directive.guidance)
     return {"directive": directive.model_dump()}
 
 
-def generate_question(state: InterviewGraphState) -> dict:
+def generate_question(state: InterviewGraphState, config: RunnableConfig) -> dict:
     """出题节点（M5 升级为面试官 Agent）：按规划官指令定向出题
 
     Agent 循环（function calling 标准套路，M3-b）：
@@ -124,8 +137,12 @@ def generate_question(state: InterviewGraphState) -> dict:
     M5 变化：messages[0] 换成面试官角色的 system prompt，
     user 消息里注入规划官的 directive——出题从"自由发挥"变"按计划执行"。
 
+    M10：工具调用/伪装接管/兜底全程落轨迹（评测脚本据此断言
+    工具调用与纠错行为是否符合预期）。
+
     出题用高温度（0.8），鼓励发散覆盖更多知识点。
     """
+    thread_id = _tid(config)
     directive = state.get("directive") or {}
     directive_text = (
         f"知识点：{directive.get('topic', '自由选择')}；"
@@ -149,10 +166,12 @@ def generate_question(state: InterviewGraphState) -> dict:
             # 协议要求：先把 assistant 的 tool_calls 消息入列，再回填对应结果
             messages.append(message)
             for call in message.tool_calls:
-                # print 是教学期的轨迹观察手段，M10 会换成正式的轨迹记录
+                # M10 起双轨：print 给人看（终端观察），log_event 给程序看（评测断言）
                 print(f"[面试官·工具调用] {call.function.name}({call.function.arguments})")
                 result = execute_tool(call.function.name, call.function.arguments)
                 print(f"[面试官·工具结果] {result[:200]}")
+                tracing.log_event(thread_id, "tool_call", name=call.function.name,
+                                  arguments=call.function.arguments, result=result[:200])
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.id,  # 结果必须与请求一一对应
@@ -172,6 +191,8 @@ def generate_question(state: InterviewGraphState) -> dict:
                 result = execute_tool(call["name"], call["arguments"])
                 print(f"[面试官·工具结果] {result[:200]}")
                 observed.append(f"{call['name']}({call['arguments']}) → {result}")
+            tracing.log_event(thread_id, "fake_tool_call",
+                              calls=[c["name"] for c in fake_calls], results=observed)
             messages.append({
                 "role": "user",
                 "content": (
@@ -189,6 +210,7 @@ def generate_question(state: InterviewGraphState) -> dict:
         # 兜底：达到工具轮数上限仍没拿到最终问题，撤掉工具声明直接要答案
         # 注意 M5 后 messages[0] 是 system 人设，必须保留 [:2] 再撤工具
         question = llm.chat(messages=messages[:2], temperature=0.8).strip()
+        tracing.log_event(thread_id, "fallback_no_tools", question=question[:120])
     return {
         "current_question": question,
         "round_count": state.get("round_count", 0) + 1,
@@ -211,19 +233,23 @@ def ask_candidate(state: InterviewGraphState) -> dict:
 _CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
 
-def run_code(state: InterviewGraphState) -> dict:
+def run_code(state: InterviewGraphState, config: RunnableConfig) -> dict:
     """代码沙箱节点（M6 新增）：候选人回答里的代码块真正跑一遍
 
     Agent 决策依据的升级：评估官不再猜"这段代码能不能跑"，
     而是拿到真实运行结果（输出/报错/超时）再打分——
     LLM 心算运行结果经常出错，沙箱给的是事实。
 
+    M10：沙箱执行结果落轨迹（评测脚本据此断言"有代码就有实测"）。
+
     本轮回答没有代码块时显式把 code_result 置回 None：
     该字段留在 state 里会跨轮残留，必须每轮清理。
     """
+    thread_id = _tid(config)
     answer = state.get("last_answer") or ""
     matches = list(_CODE_BLOCK_RE.finditer(answer))
     if not matches:
+        tracing.log_event(thread_id, "sandbox", status="no_code", blocks=0)
         return {"code_result": None}  # 无代码块：清理旧值并空转通过
     # 取最后一个代码块：候选人常先用小片段讲解，最终答案代码通常放在最后
     code = matches[-1].group(1)
@@ -232,10 +258,11 @@ def run_code(state: InterviewGraphState) -> dict:
     label = "成功" if result["ok"] else ("超时强杀" if result["timed_out"] else "报错")
     preview = (result["stdout"] or result["stderr"]).strip()[:120]
     print(f"[沙箱] 执行{label}：{preview}")
+    tracing.log_event(thread_id, "sandbox", status=label, blocks=len(matches), preview=preview)
     return {"code_result": sandbox.format_result(result)}
 
 
-def evaluate(state: InterviewGraphState) -> dict:
+def evaluate(state: InterviewGraphState, config: RunnableConfig) -> dict:
     """评估节点（M5 升级为评估官 Agent）：低温度（0.2）打分 + Pydantic 结构化校验 + 记录本轮问答
 
     评估官有独立的 system 人设（agents.EVALUATOR_SYSTEM），
@@ -247,7 +274,9 @@ def evaluate(state: InterviewGraphState) -> dict:
     延续 M4 的"无损存储、有损注入"原则。
     M9：解析交给 chat_structured——评估官偶发输出坏 JSON 时自动回填
     错误重试，不再让 evaluate 节点直接崩溃。
+    M10：评分结果落轨迹（评测脚本据此断言分数/动作分布与重试预算）。
     """
+    thread_id = _tid(config)
     # M7：清洗不可信回答，评估输入用的是带数据标记的版本
     safe_answer = sanitize_answer(state["last_answer"])
     if state.get("code_result"):
@@ -270,6 +299,7 @@ def evaluate(state: InterviewGraphState) -> dict:
         ],
         model_cls=EvaluationResult,
         temperature=0.2,
+        trace_thread_id=thread_id,  # M10：坏 JSON 重试同步落轨迹
     )
     qa = QAItem(
         question=state["current_question"],
@@ -278,6 +308,8 @@ def evaluate(state: InterviewGraphState) -> dict:
         comment=result.comment,
         created_at=datetime.now(),
     )
+    tracing.log_event(thread_id, "evaluate", score=result.score,
+                      action=result.action.value, comment=result.comment)
     updates: dict = {
         "last_score": result.score,
         "last_comment": result.comment,
@@ -298,7 +330,7 @@ def route_after_evaluate(state: InterviewGraphState) -> str:
     return state["action"]
 
 
-def approval(state: InterviewGraphState) -> dict:
+def approval(state: InterviewGraphState, config: RunnableConfig) -> dict:
     """人工审批节点（M8 新增）：评估官的 finish 决策执行前必须过人
 
     结束面试并生成终评是不可逆动作——终评一出，面试即成定论。
@@ -307,16 +339,23 @@ def approval(state: InterviewGraphState) -> dict:
     - 外部 Command(resume=False) → 驳回，条件边回到 plan_topic 继续面试
       （M2 的检查点保证驳回后现场不丢，图原地"倒车回主路"）
 
+    M10：审批请求与人工决定都落轨迹（评测脚本据此断言
+    "finish 从未被绕过审批直接执行"——不可逆动作的审计证据）。
+
     教学点：interrupt 不只能"等输入"，还能做"高风险决策的人工把关"——
     Agent 可以自主建议，但不可逆动作的执行权在人类手里。
     """
-    approved = interrupt({
+    tracing.log_event(_tid(config), "approval_requested",
+                      round_count=state.get("round_count", 0),
+                      last_score=state.get("last_score"))
+    approved = bool(interrupt({
         "event": "finish_approval",
         "message": "评估官建议结束面试并生成终评报告（不可逆动作），请审批",
         "round_count": state.get("round_count", 0),
         "last_score": state.get("last_score"),
-    })
-    return {"approved": bool(approved)}
+    }))
+    tracing.log_event(_tid(config), "approval", approved=approved)
+    return {"approved": approved}
 
 
 def route_after_approval(state: InterviewGraphState) -> str:
@@ -324,7 +363,7 @@ def route_after_approval(state: InterviewGraphState) -> str:
     return "summarize" if state["approved"] else "plan_topic"
 
 
-def summarize(state: InterviewGraphState) -> dict:
+def summarize(state: InterviewGraphState, config: RunnableConfig) -> dict:
     """总结节点（M8 起审批通过后才执行）：生成整场面试的评语，随后图走到 END"""
     report = llm.chat(
         messages=[{
@@ -337,6 +376,7 @@ def summarize(state: InterviewGraphState) -> dict:
         }],
         temperature=0.4,
     )
+    tracing.log_event(_tid(config), "summary", round_count=state.get("round_count", 0))
     return {"summary": report.strip(), "current_question": None}
 
 

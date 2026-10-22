@@ -13,3 +13,6 @@ venv/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# M10 运行时轨迹产物（一场面试一个 JSONL，属运行数据不入库）
+traces/
