@@ -6,6 +6,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from app.interview.state_machine import InterviewState
+from app.security import MAX_ANSWER_LENGTH
 
 
 class NextAction(str, Enum):
@@ -67,7 +68,13 @@ class InterviewStartRequest(BaseModel):
 class InterviewAnswerRequest(BaseModel):
     """提交回答的请求体"""
 
-    answer: str = Field(min_length=1, description="候选人的回答内容")
+    # M7 入口层防御：超长报文在 HTTP 边界就被 422 拒绝，不给恶意大报文
+    # 进入业务逻辑的机会（绕过 HTTP 的内部调用由 sanitize_answer 清洗层兜底）
+    answer: str = Field(
+        min_length=1,
+        max_length=MAX_ANSWER_LENGTH,
+        description="候选人的回答内容",
+    )
 
 
 class GraphInterviewSnapshot(BaseModel):

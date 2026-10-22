@@ -9,7 +9,8 @@ M1 的痛点 → M2 的解法：
 START → plan_topic（M5：规划官决定下一个考察方向）
       → generate_question（M5：面试官按规划指令定向出题）
       → ask_candidate（interrupt 暂停，等候选人提交答案）
-      → evaluate（M5：评估官独立人设打分）
+      → run_code（M6：沙箱真实执行回答中的代码块）
+      → evaluate（M5：评估官独立人设打分；M7：回答先过安全清洗）
       → manage_memory（M4：滑窗外的早期问答滚动压缩进摘要）
       → 条件边：followup/next → 回到 plan_topic（循环）
                finish        → summarize → END
@@ -39,6 +40,7 @@ from app.interview.prompts import (
 )
 from app.interview.schemas import EvaluationResult, NextAction, QAItem
 from app.interview.tools import TOOLS, execute_tool
+from app.security import sanitize_answer
 from app.interview.service import _clean_json
 
 # 检查点数据库：LangGraph 每个步骤都会把状态快照写进这个文件
@@ -212,11 +214,15 @@ def evaluate(state: InterviewGraphState) -> dict:
     与出题的面试官分离——避免"出题者自己评估自己"的角色混淆。
     M6：若沙箱跑出了真实运行结果，作为证据追加进评估输入——
     不改共享的 EVALUATE_PROMPT 模板（M1 的 service 也在用它）。
+    M7：候选人回答是不可信的外部数据，注入提示词前先过 sanitize_answer
+    （截断 + 数据/指令分离标记）；history 里存的仍是原始回答——
+    延续 M4 的"无损存储、有损注入"原则。
     """
-    answer = state["last_answer"]
+    # M7：清洗不可信回答，评估输入用的是带数据标记的版本
+    safe_answer = sanitize_answer(state["last_answer"])
     if state.get("code_result"):
-        answer = (
-            f"{answer}\n\n"
+        safe_answer = (
+            f"{safe_answer}\n\n"
             f"【沙箱实测】候选人代码块的真实运行结果（以此为准，不要凭记忆猜测代码输出）：\n"
             f"{state['code_result']}"
         )
@@ -228,7 +234,7 @@ def evaluate(state: InterviewGraphState) -> dict:
                 "content": EVALUATE_PROMPT.format(
                     position=state["position"],
                     question=state["current_question"],
-                    answer=state["last_answer"],
+                    answer=safe_answer,  # 用清洗后的版本（此前误传原始回答，沙箱证据没真正进提示词）
                 ),
             },
         ],
