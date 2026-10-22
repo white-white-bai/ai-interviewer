@@ -77,11 +77,19 @@ class InterviewAnswerRequest(BaseModel):
     )
 
 
+class InterviewApprovalRequest(BaseModel):
+    """人工审批的请求体（M8）：批准或驳回评估官"结束面试"的决策"""
+
+    approved: bool = Field(description="true=批准结束面试并生成终评；false=驳回，面试继续")
+
+
 class GraphInterviewSnapshot(BaseModel):
     """LangGraph 版面试会话快照（数据来自检查点 get_state，M2 新增）"""
 
     thread_id: str = Field(description="LangGraph 线程 ID，等同于 M1 的 session_id")
-    status: str = Field(description="waiting_answer=等待回答 / finished=已结束")
+    status: str = Field(
+        description="waiting_answer=等待回答 / waiting_approval=等待人工审批（M8）/ finished=已结束"
+    )
     next_node: list[str] = Field(description="图接下来要执行的节点；空列表=已到 END")
     candidate_name: str | None = None
     position: str | None = None

@@ -13,7 +13,9 @@ START → plan_topic（M5：规划官决定下一个考察方向）
       → evaluate（M5：评估官独立人设打分；M7：回答先过安全清洗）
       → manage_memory（M4：滑窗外的早期问答滚动压缩进摘要）
       → 条件边：followup/next → 回到 plan_topic（循环）
-               finish        → summarize → END
+               finish        → approval（M8：结束面试属不可逆动作，先过人工审批）
+                               批准 → summarize → END
+                               驳回 → 回 plan_topic 继续面试
 
 三个 Agent（规划官/面试官/评估官）不互相喊话，
 通过共享 state 的 directive 字段传递结构化消息。
@@ -78,6 +80,8 @@ class InterviewGraphState(TypedDict):
     directive: dict | None
     # M6 沙箱字段：候选人代码块的真实运行结果（本轮没有代码块则为 None）
     code_result: str | None
+    # M8 人工审批字段：评估官的 finish 决策是否被人工批准
+    approved: bool | None
 
 
 def _format_history(history: list[dict]) -> str:
@@ -268,8 +272,34 @@ def route_after_evaluate(state: InterviewGraphState) -> str:
     return state["action"]
 
 
+def approval(state: InterviewGraphState) -> dict:
+    """人工审批节点（M8 新增）：评估官的 finish 决策执行前必须过人
+
+    结束面试并生成终评是不可逆动作——终评一出，面试即成定论。
+    interrupt() 在这里第二次暂停图，把决策权交给外部人类：
+    - 外部 Command(resume=True)  → 批准，条件边走向 summarize 正常收尾
+    - 外部 Command(resume=False) → 驳回，条件边回到 plan_topic 继续面试
+      （M2 的检查点保证驳回后现场不丢，图原地"倒车回主路"）
+
+    教学点：interrupt 不只能"等输入"，还能做"高风险决策的人工把关"——
+    Agent 可以自主建议，但不可逆动作的执行权在人类手里。
+    """
+    approved = interrupt({
+        "event": "finish_approval",
+        "message": "评估官建议结束面试并生成终评报告（不可逆动作），请审批",
+        "round_count": state.get("round_count", 0),
+        "last_score": state.get("last_score"),
+    })
+    return {"approved": bool(approved)}
+
+
+def route_after_approval(state: InterviewGraphState) -> str:
+    """审批结果路由：批准去生成终评，驳回回规划官继续面试"""
+    return "summarize" if state["approved"] else "plan_topic"
+
+
 def summarize(state: InterviewGraphState) -> dict:
-    """总结节点（finish 分支专属）：生成整场面试的评语，随后图走到 END"""
+    """总结节点（M8 起审批通过后才执行）：生成整场面试的评语，随后图走到 END"""
     report = llm.chat(
         messages=[{
             "role": "user",
@@ -297,6 +327,7 @@ def build_interview_graph():
     builder.add_node("run_code", run_code)  # M6：代码沙箱节点
     builder.add_node("evaluate", evaluate)
     builder.add_node("manage_memory", manage_memory)  # M4：记忆管理节点
+    builder.add_node("approval", approval)  # M8：人工审批节点
     builder.add_node("summarize", summarize)
 
     builder.add_edge(START, "plan_topic")
@@ -306,11 +337,18 @@ def build_interview_graph():
     builder.add_edge("run_code", "evaluate")
     builder.add_edge("evaluate", "manage_memory")
     # 条件边从 manage_memory 挂出：history 已更新完毕，摘要也已滚动，
-    # followup/next 都回到规划官——每一道新题都先经规划再出题
+    # followup/next 都回到规划官——每一道新题都先经规划再出题；
+    # finish 不再直达总结，而是先去审批节点（M8：不可逆动作过人）
     builder.add_conditional_edges(
         "manage_memory",
         route_after_evaluate,
-        {"followup": "plan_topic", "next": "plan_topic", "finish": "summarize"},
+        {"followup": "plan_topic", "next": "plan_topic", "finish": "approval"},
+    )
+    # M8：审批结果分岔——批准收尾，驳回回到规划官继续面试
+    builder.add_conditional_edges(
+        "approval",
+        route_after_approval,
+        {"summarize": "summarize", "plan_topic": "plan_topic"},
     )
     builder.add_edge("summarize", END)
     # compile 时挂上 checkpointer：之后每一步自动写档，支持暂停/恢复/读档
