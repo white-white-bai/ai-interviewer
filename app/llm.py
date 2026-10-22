@@ -1,7 +1,46 @@
-from openai import OpenAI
+import time
+
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 from pydantic import BaseModel, ValidationError
 
 from app.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+
+# 网络层可重试异常（M11）：超时/连接失败/限流/服务端 5xx——
+# 这些是"基础设施抖动"，重试就有机会成功；4xx 参数错误重试无意义
+NETWORK_ERRORS = (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError)
+
+
+def _call_with_backoff(fn, *, max_attempts: int = 3, base_delay: float = 1.0):
+    """网络容错封装：可重试异常按指数退避重试（M11 降级兜底第一层）
+
+    与 M9 的"错误回填重试"不同层：M9 重试的是模型输出内容不合格
+    （把坏输出喂回去让它改），这里重试的是调用本身没到达/被限流
+    （同一个请求原样再发）。
+
+    Args:
+        fn: 无参可调用（闭包包住一次 API 调用）
+        max_attempts: 最大尝试次数（含首次）
+        base_delay: 首次重试前等待秒数，之后指数翻倍（1s → 2s）
+
+    Returns:
+        fn 的返回值；重试耗尽仍失败则抛出最后一次异常，
+        由上层节点（graph 的降级路径）接住——网络层不吞异常。
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except NETWORK_ERRORS as exc:
+            if attempt == max_attempts:
+                raise  # 最后一击也失败：原样上抛，降级责任交给节点层
+            delay = base_delay * 2 ** (attempt - 1)
+            print(f"[网络重试] {type(exc).__name__}，{delay} 秒后重试（第 {attempt + 1}/{max_attempts} 次）")
+            time.sleep(delay)
 
 
 def get_llm_client() -> OpenAI:
@@ -22,12 +61,16 @@ def chat(messages: list[dict], temperature: float = 0.7) -> str:
 
     messages 标准 OpenAI 格式：[{"role": "system"/"user"/"assistant", "content": "..."}]
     temperature 控制随机性：0 最稳定（适合评估打分），1 更发散（适合出题）。
+
+    M11：网络抖动（超时/限流/连接错误）自动退避重试。
     """
     client = get_llm_client()
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        temperature=temperature,
+    response = _call_with_backoff(
+        lambda: client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=temperature,
+        )
     )
     # 取第一个候选的回复内容
     return response.choices[0].message.content
@@ -39,13 +82,17 @@ def chat_with_tools(messages: list, tools: list, temperature: float = 0.7):
     与 chat() 的区别：模型可能不直接回答，而是返回带 tool_calls 的消息
     （想调用哪个工具、传什么参数）。调用方需要执行工具、把结果以
     role=tool 消息回填进 messages 再次调用——这就是 Agent 循环。
+
+    M11：网络抖动（超时/限流/连接错误）自动退避重试。
     """
     client = get_llm_client()
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        tools=tools,
-        temperature=temperature,
+    response = _call_with_backoff(
+        lambda: client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            tools=tools,
+            temperature=temperature,
+        )
     )
     # 返回完整消息对象：含 content / tool_calls / role 等字段
     return response.choices[0].message

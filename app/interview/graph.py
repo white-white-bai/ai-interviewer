@@ -34,7 +34,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from app import llm, sandbox
-from app.interview import agents
+from app.interview import agents, fallbacks, tracing
 from app.interview.memory import format_memory, manage_memory
 from app.interview.prompts import (
     EVALUATE_PROMPT,
@@ -43,7 +43,6 @@ from app.interview.prompts import (
 )
 from app.interview.schemas import EvaluationResult, NextAction, QAItem
 from app.interview.tools import TOOLS, execute_tool, extract_text_tool_calls
-from app.interview import tracing
 from app.security import sanitize_answer
 
 # 检查点数据库：LangGraph 每个步骤都会把状态快照写进这个文件
@@ -119,10 +118,19 @@ def plan_topic(state: InterviewGraphState, config: RunnableConfig) -> dict:
     Agent 之间不直接对话，图的共享状态就是协作介质。
 
     M10：规划结果同步落轨迹（评测脚本据此断言"每一题都经规划"）。
+    M11：LLM 重试耗尽仍失败时降级到兜底考点池——面试不中断，
+    降级事实落轨迹（plan_fallback 事件）供审计。
     """
-    directive = agents.plan_next_topic(state, thread_id=_tid(config))
+    thread_id = _tid(config)
+    try:
+        directive = agents.plan_next_topic(state, thread_id=thread_id)
+    except Exception as exc:  # 降级要兜一切意外（网络/解析/未知），不能让图崩溃
+        print(f"[规划官·降级] LLM 不可用（{type(exc).__name__}），使用兜底考点池")
+        directive = fallbacks.fallback_directive(state.get("round_count", 0))
+        tracing.log_event(thread_id, "plan_fallback", reason=str(exc)[:120],
+                          topic=directive.topic)
     print(f"[规划官] 下一考点：{directive.topic}（{directive.guidance}）")
-    tracing.log_event(_tid(config), "plan", topic=directive.topic, guidance=directive.guidance)
+    tracing.log_event(thread_id, "plan", topic=directive.topic, guidance=directive.guidance)
     return {"directive": directive.model_dump()}
 
 
@@ -139,6 +147,8 @@ def generate_question(state: InterviewGraphState, config: RunnableConfig) -> dic
 
     M10：工具调用/伪装接管/兜底全程落轨迹（评测脚本据此断言
     工具调用与纠错行为是否符合预期）。
+    M11：LLM 重试耗尽仍失败（或工具层意外）时降级到兜底题池——
+    面试不中断，降级事实落轨迹（generate_fallback 事件）供审计。
 
     出题用高温度（0.8），鼓励发散覆盖更多知识点。
     """
@@ -159,58 +169,63 @@ def generate_question(state: InterviewGraphState, config: RunnableConfig) -> dic
         {"role": "user", "content": user_content},
     ]
     question = ""
-    for _ in range(MAX_TOOL_ROUNDS):
-        message = llm.chat_with_tools(messages, tools=TOOLS, temperature=0.8)
-        if message.tool_calls:
-            # 标准路径：模型返回了结构化 tool_calls，按协议回填
-            # 协议要求：先把 assistant 的 tool_calls 消息入列，再回填对应结果
-            messages.append(message)
-            for call in message.tool_calls:
-                # M10 起双轨：print 给人看（终端观察），log_event 给程序看（评测断言）
-                print(f"[面试官·工具调用] {call.function.name}({call.function.arguments})")
-                result = execute_tool(call.function.name, call.function.arguments)
-                print(f"[面试官·工具结果] {result[:200]}")
-                tracing.log_event(thread_id, "tool_call", name=call.function.name,
-                                  arguments=call.function.arguments, result=result[:200])
+    try:
+        for _ in range(MAX_TOOL_ROUNDS):
+            message = llm.chat_with_tools(messages, tools=TOOLS, temperature=0.8)
+            if message.tool_calls:
+                # 标准路径：模型返回了结构化 tool_calls，按协议回填
+                # 协议要求：先把 assistant 的 tool_calls 消息入列，再回填对应结果
+                messages.append(message)
+                for call in message.tool_calls:
+                    # M10 起双轨：print 给人看（终端观察），log_event 给程序看（评测断言）
+                    print(f"[面试官·工具调用] {call.function.name}({call.function.arguments})")
+                    result = execute_tool(call.function.name, call.function.arguments)
+                    print(f"[面试官·工具结果] {result[:200]}")
+                    tracing.log_event(thread_id, "tool_call", name=call.function.name,
+                                      arguments=call.function.arguments, result=result[:200])
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,  # 结果必须与请求一一对应
+                        "content": result,
+                    })
+                continue
+            content = (message.content or "").strip()
+            fake_calls = extract_text_tool_calls(content)
+            if fake_calls:
+                # M9 场景③：DeepSeek 偶发把 <tool_call> 按训练模板格式写进正文，
+                # 兼容层解析不出 tool_calls（M3-b 伏笔兑现）——解析后代为执行，
+                # 结果以 user 消息回填（不伪造 role=tool 消息，避免协议校验失败）
+                messages.append(message)
+                observed = []
+                for call in fake_calls:
+                    print(f"[面试官·文本伪装工具调用→已接管] {call['name']}({call['arguments']})")
+                    result = execute_tool(call["name"], call["arguments"])
+                    print(f"[面试官·工具结果] {result[:200]}")
+                    observed.append(f"{call['name']}({call['arguments']}) → {result}")
+                tracing.log_event(thread_id, "fake_tool_call",
+                                  calls=[c["name"] for c in fake_calls], results=observed)
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,  # 结果必须与请求一一对应
-                    "content": result,
+                    "role": "user",
+                    "content": (
+                        "系统提示：检测到你把工具调用写在正文 <tool_call> 标签里，"
+                        "本接口只认标准 tool_calls 字段。已代为执行，结果如下：\n"
+                        + "\n".join(observed)
+                        + "\n请基于以上结果继续；若已能出题，只输出问题本身。"
+                    ),
                 })
-            continue
-        content = (message.content or "").strip()
-        fake_calls = extract_text_tool_calls(content)
-        if fake_calls:
-            # M9 场景③：DeepSeek 偶发把 <tool_call> 按训练模板格式写进正文，
-            # 兼容层解析不出 tool_calls（M3-b 伏笔兑现）——解析后代为执行，
-            # 结果以 user 消息回填（不伪造 role=tool 消息，避免协议校验失败）
-            messages.append(message)
-            observed = []
-            for call in fake_calls:
-                print(f"[面试官·文本伪装工具调用→已接管] {call['name']}({call['arguments']})")
-                result = execute_tool(call["name"], call["arguments"])
-                print(f"[面试官·工具结果] {result[:200]}")
-                observed.append(f"{call['name']}({call['arguments']}) → {result}")
-            tracing.log_event(thread_id, "fake_tool_call",
-                              calls=[c["name"] for c in fake_calls], results=observed)
-            messages.append({
-                "role": "user",
-                "content": (
-                    "系统提示：检测到你把工具调用写在正文 <tool_call> 标签里，"
-                    "本接口只认标准 tool_calls 字段。已代为执行，结果如下：\n"
-                    + "\n".join(observed)
-                    + "\n请基于以上结果继续；若已能出题，只输出问题本身。"
-                ),
-            })
-            continue
-        # 既无 tool_calls 也无伪装调用：message.content 就是最终问题
-        question = content
-        break
-    if not question:
-        # 兜底：达到工具轮数上限仍没拿到最终问题，撤掉工具声明直接要答案
-        # 注意 M5 后 messages[0] 是 system 人设，必须保留 [:2] 再撤工具
-        question = llm.chat(messages=messages[:2], temperature=0.8).strip()
-        tracing.log_event(thread_id, "fallback_no_tools", question=question[:120])
+                continue
+            # 既无 tool_calls 也无伪装调用：message.content 就是最终问题
+            question = content
+            break
+        if not question:
+            # 兜底：达到工具轮数上限仍没拿到最终问题，撤掉工具声明直接要答案
+            # 注意 M5 后 messages[0] 是 system 人设，必须保留 [:2] 再撤工具
+            question = llm.chat(messages=messages[:2], temperature=0.8).strip()
+            tracing.log_event(thread_id, "fallback_no_tools", question=question[:120])
+    except Exception as exc:  # 降级要兜一切意外，不能让图崩溃
+        print(f"[面试官·降级] LLM/工具不可用（{type(exc).__name__}），使用兜底题池")
+        question = fallbacks.fallback_question(state.get("round_count", 0))
+        tracing.log_event(thread_id, "generate_fallback", reason=str(exc)[:120])
     return {
         "current_question": question,
         "round_count": state.get("round_count", 0) + 1,
@@ -275,6 +290,8 @@ def evaluate(state: InterviewGraphState, config: RunnableConfig) -> dict:
     M9：解析交给 chat_structured——评估官偶发输出坏 JSON 时自动回填
     错误重试，不再让 evaluate 节点直接崩溃。
     M10：评分结果落轨迹（评测脚本据此断言分数/动作分布与重试预算）。
+    M11：LLM 重试耗尽仍失败时降级为中性默认分（5 分 + 降级标记），
+    不惩罚候选人、不卡死流程，降级事实落轨迹（evaluate_fallback）。
     """
     thread_id = _tid(config)
     # M7：清洗不可信回答，评估输入用的是带数据标记的版本
@@ -285,22 +302,27 @@ def evaluate(state: InterviewGraphState, config: RunnableConfig) -> dict:
             f"【沙箱实测】候选人代码块的真实运行结果（以此为准，不要凭记忆猜测代码输出）：\n"
             f"{state['code_result']}"
         )
-    result = llm.chat_structured(
-        messages=[
-            {"role": "system", "content": agents.EVALUATOR_SYSTEM},
-            {
-                "role": "user",
-                "content": EVALUATE_PROMPT.format(
-                    position=state["position"],
-                    question=state["current_question"],
-                    answer=safe_answer,  # 用清洗后的版本（此前误传原始回答，沙箱证据没真正进提示词）
-                ),
-            },
-        ],
-        model_cls=EvaluationResult,
-        temperature=0.2,
-        trace_thread_id=thread_id,  # M10：坏 JSON 重试同步落轨迹
-    )
+    try:
+        result = llm.chat_structured(
+            messages=[
+                {"role": "system", "content": agents.EVALUATOR_SYSTEM},
+                {
+                    "role": "user",
+                    "content": EVALUATE_PROMPT.format(
+                        position=state["position"],
+                        question=state["current_question"],
+                        answer=safe_answer,  # 用清洗后的版本（此前误传原始回答，沙箱证据没真正进提示词）
+                    ),
+                },
+            ],
+            model_cls=EvaluationResult,
+            temperature=0.2,
+            trace_thread_id=thread_id,  # M10：坏 JSON 重试同步落轨迹
+        )
+    except Exception as exc:  # 降级要兜一切意外，不能让图崩溃
+        print(f"[评估官·降级] LLM 不可用（{type(exc).__name__}），按中性分处理")
+        result = fallbacks.fallback_evaluation()
+        tracing.log_event(thread_id, "evaluate_fallback", reason=str(exc)[:120])
     qa = QAItem(
         question=state["current_question"],
         answer=state["last_answer"],
@@ -364,18 +386,27 @@ def route_after_approval(state: InterviewGraphState) -> str:
 
 
 def summarize(state: InterviewGraphState, config: RunnableConfig) -> dict:
-    """总结节点（M8 起审批通过后才执行）：生成整场面试的评语，随后图走到 END"""
-    report = llm.chat(
-        messages=[{
-            "role": "user",
-            "content": SUMMARY_PROMPT.format(
-                position=state["position"],
-                candidate_name=state["candidate_name"],
-                history_text=_format_history(state.get("history", [])),
-            ),
-        }],
-        temperature=0.4,
-    )
+    """总结节点（M8 起审批通过后才执行）：生成整场面试的评语，随后图走到 END
+
+    M11：LLM 不可用时降级为统计式报告（基于 history 拼接，不调 LLM），
+    终评"有交代"，降级事实落轨迹（summary_fallback）。
+    """
+    try:
+        report = llm.chat(
+            messages=[{
+                "role": "user",
+                "content": SUMMARY_PROMPT.format(
+                    position=state["position"],
+                    candidate_name=state["candidate_name"],
+                    history_text=_format_history(state.get("history", [])),
+                ),
+            }],
+            temperature=0.4,
+        )
+    except Exception as exc:  # 降级要兜一切意外，不能让图崩溃
+        print(f"[终评·降级] LLM 不可用（{type(exc).__name__}），输出统计式报告")
+        report = fallbacks.fallback_summary(state)
+        tracing.log_event(_tid(config), "summary_fallback", reason=str(exc)[:120])
     tracing.log_event(_tid(config), "summary", round_count=state.get("round_count", 0))
     return {"summary": report.strip(), "current_question": None}
 
