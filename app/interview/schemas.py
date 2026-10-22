@@ -75,3 +75,5 @@ class GraphInterviewSnapshot(BaseModel):
     followup_count: int = 0
     round_count: int = 0
     history: list[QAItem] = []
+    # M4 记忆字段：早期问答滚动摘要（history 仍为全量原文，二者并存）
+    memory_summary: str | None = None

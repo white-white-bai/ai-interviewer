@@ -45,6 +45,7 @@ def _snapshot(thread_id: str) -> GraphInterviewSnapshot:
         followup_count=values.get("followup_count", 0),
         round_count=values.get("round_count", 0),
         history=[QAItem(**qa) for qa in values.get("history", [])],
+        memory_summary=values.get("memory_summary"),
     )
 
 

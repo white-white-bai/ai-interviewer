@@ -9,6 +9,7 @@ M1 的痛点 → M2 的解法：
 START → generate_question（出题）
       → ask_candidate（interrupt 暂停，等候选人提交答案）
       → evaluate（评估打分）
+      → manage_memory（M4：滑窗外的早期问答滚动压缩进摘要）
       → 条件边：followup/next → 回到 generate_question（循环）
                finish        → summarize → END
 """
@@ -24,6 +25,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from app import llm
+from app.interview.memory import format_memory, manage_memory
 from app.interview.prompts import (
     EVALUATE_PROMPT,
     QUESTION_WITH_TOOLS_PROMPT,
@@ -61,10 +63,17 @@ class InterviewGraphState(TypedDict):
     followup_count: int
     round_count: int
     summary: str | None
+    # M4 记忆字段：摘要 + 进度水位线（前 memory_upto 轮已并入摘要）
+    memory_summary: str | None
+    memory_upto: int
 
 
 def _format_history(history: list[dict]) -> str:
-    """把历史问答（QAItem 字典列表）整理成提示词文本；无历史时返回占位说明"""
+    """全量拼接历史问答（M4 起仅供 summarize 终评使用——总结需要完整信息）
+
+    出题提示词已改用 memory.format_memory（摘要 + 滑窗），
+    这里保留是因为最终评语必须覆盖每一轮，属于一次性开销。
+    """
     if not history:
         return "（暂无，这是第一个问题）"
     lines = []
@@ -90,7 +99,7 @@ def generate_question(state: InterviewGraphState) -> dict:
     user_content = QUESTION_WITH_TOOLS_PROMPT.format(
         position=state["position"],
         candidate_name=state["candidate_name"],
-        history_text=_format_history(state.get("history", [])),
+        memory_text=format_memory(state),
     )
     messages: list = [{"role": "user", "content": user_content}]
     question = ""
@@ -200,15 +209,17 @@ def build_interview_graph():
     builder.add_node("generate_question", generate_question)
     builder.add_node("ask_candidate", ask_candidate)
     builder.add_node("evaluate", evaluate)
+    builder.add_node("manage_memory", manage_memory)  # M4：记忆管理节点
     builder.add_node("summarize", summarize)
 
     builder.add_edge(START, "generate_question")
     builder.add_edge("generate_question", "ask_candidate")
     builder.add_edge("ask_candidate", "evaluate")
-    # 条件边：路由函数返回值 → 映射表 → 下一个节点
-    # followup 和 next 都回到出题节点，区别只体现在下一题的提示词历史里
+    builder.add_edge("evaluate", "manage_memory")
+    # 条件边从 manage_memory 挂出：history 已更新完毕，摘要也已滚动，
+    # 之后的分流（followup/next/finish）基于"压缩后"的最新状态做决策
     builder.add_conditional_edges(
-        "evaluate",
+        "manage_memory",
         route_after_evaluate,
         {"followup": "generate_question", "next": "generate_question", "finish": "summarize"},
     )
