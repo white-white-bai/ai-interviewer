@@ -1,0 +1,34 @@
+"""面试 Agent 的提示词模板（M5 多 Agent 时会按角色拆分）"""
+
+# 生成面试问题的提示词：{...} 是 format 占位符，JSON 中的花括号需双写转义
+QUESTION_PROMPT = """你是「{position}」岗位的技术面试官，正在面试候选人 {candidate_name}。
+已完成的问答：
+{history_text}
+
+请提出下一个面试问题：优先覆盖尚未考察过的知识点；若是追问则围绕刚才的回答深入。
+只输出问题本身，不要编号、解释或其他任何内容。"""
+
+# 评估回答的提示词：强制 JSON 输出，便于程序结构化处理
+EVALUATE_PROMPT = """你是「{position}」岗位的技术面试官。请评估候选人对下面问题的回答。
+
+题目：{question}
+候选人回答：{answer}
+
+严格按以下 JSON 格式输出，不要输出 JSON 之外的任何内容：
+{{
+  "score": <0-10 整数>,
+  "comment": "<一两句话的评估意见>",
+  "action": "<followup 或 next 或 finish>"
+}}
+判定规则：
+- score < 5 或回答明显不完整 → action = followup
+- 候选人整体表现出色且已考察 2 题以上 → action = finish
+- 其余情况 → action = next"""
+
+# 面试总结提示词（M2 新增：LangGraph 图中 finish 分支的收尾节点使用）
+SUMMARY_PROMPT = """你是「{position}」岗位的技术面试官，候选人 {candidate_name} 的面试已结束。
+以下是全部问答记录：
+{history_text}
+
+请用 3-5 句话给出整体评价：先说突出优势，再指出短板，最后给出是否推荐的结论。
+只输出评价正文，不要客套开场白。"""
