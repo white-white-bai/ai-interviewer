@@ -343,6 +343,28 @@ def evaluate(state: InterviewGraphState, config: RunnableConfig) -> dict:
     return updates
 
 
+def manage_memory_node(state: InterviewGraphState, config: RunnableConfig) -> dict:
+    """记忆管理节点（M12 复盘补齐）：M4 压缩 + M10 轨迹 + M11 降级三合一
+
+    M12 复盘时发现的两个缺口：
+    1. M4 压缩事件从未落轨迹（机制覆盖断言缺一环）
+    2. M11 降级漏了本节点——压缩 LLM 彻底失败会让图崩溃
+
+    降级语义：跳过本轮压缩（摘要暂不更新、滑窗照常扩大）——
+    记忆层降级 = 延迟压缩，只影响 token 效率，不影响正确性。
+    """
+    try:
+        updates = manage_memory(state)
+    except Exception as exc:  # 降级要兜一切意外，不能让图崩溃
+        print(f"[记忆·降级] 压缩失败（{type(exc).__name__}），本轮跳过（滑窗照常）")
+        tracing.log_event(_tid(config), "memory_fallback", reason=str(exc)[:120])
+        updates = {}
+    if updates:
+        tracing.log_event(_tid(config), "memory",
+                          upto=updates["memory_upto"], summary_chars=len(updates["memory_summary"]))
+    return updates
+
+
 def route_after_evaluate(state: InterviewGraphState) -> str:
     """条件边路由函数：返回值决定走哪条边
 
@@ -423,7 +445,7 @@ def build_interview_graph():
     builder.add_node("ask_candidate", ask_candidate)
     builder.add_node("run_code", run_code)  # M6：代码沙箱节点
     builder.add_node("evaluate", evaluate)
-    builder.add_node("manage_memory", manage_memory)  # M4：记忆管理节点
+    builder.add_node("manage_memory", manage_memory_node)  # M4：记忆管理节点（M12 补轨迹+降级）
     builder.add_node("approval", approval)  # M8：人工审批节点
     builder.add_node("summarize", summarize)
 
