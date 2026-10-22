@@ -10,6 +10,7 @@ execute_tool 执行前先过 security.check_tool_permission（白名单校验 + 
 """
 
 import json
+import re
 
 from app import security, storage
 
@@ -40,6 +41,43 @@ TOOLS = [
         },
     }
 ]
+
+
+# <tool_call> 文本伪装块的提取正则（M9 场景③）：匹配模型按训练模板格式
+# 写在正文里的工具调用，非贪婪跨行匹配花括号内容
+_TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+def extract_text_tool_calls(text: str) -> list[dict]:
+    """从模型正文中提取 <tool_call> 标签伪装的工具调用（M9 场景③）
+
+    背景（M3-b 伏笔兑现）：DeepSeek 偶发把工具调用按训练模板格式写成
+    正文文本 <tool_call>{...}</tool_call>，OpenAI 兼容层解析不出
+    tool_calls 字段——伪装文本会被当成最终回答输出，Agent 循环就此漏掉
+    一次该做的工具查询。
+
+    处理策略：解析出 name/arguments 交给调用方（graph.generate_question）
+    代为执行；单个块解析失败（坏 JSON）直接忽略，不影响其他块。
+
+    Args:
+        text: 模型输出的正文文本
+
+    Returns:
+        [{"name": 工具名, "arguments": JSON 字符串参数}]，无伪装块时为空列表
+    """
+    calls: list[dict] = []
+    for match in _TEXT_TOOL_CALL_RE.finditer(text):
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue  # 伪装块本身也是坏 JSON：忽略此块，不中断其他块
+        name = payload.get("name", "")
+        args = payload.get("arguments", {})
+        # arguments 可能是对象也可能是字符串，统一归一成 JSON 字符串（execute_tool 的入参约定）
+        arguments = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        if name:
+            calls.append({"name": name, "arguments": arguments})
+    return calls
 
 
 def execute_tool(name: str, arguments: str) -> str:

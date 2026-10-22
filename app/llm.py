@@ -88,13 +88,16 @@ def chat_structured(
     """
     convo = list(messages)
     last_error: ValidationError | None = None
-    for _ in range(max_retries + 1):
+    for attempt in range(max_retries + 1):
         raw = chat(messages=convo, temperature=temperature)
         try:
             return model_cls.model_validate_json(_clean_json(raw))
         except ValidationError as exc:
             last_error = exc
             first = exc.errors()[0]
+            # print 是教学期的轨迹观察手段（M10 换正式轨迹记录）：
+            # 让"自我纠错"发生时可见——第几轮重试、错在哪
+            print(f"[自我纠错] 结构化输出解析失败（{first.get('msg')}），回填错误重试（第 {attempt + 1}/{max_retries} 次）")
             # 回填坏输出 + 纠错指令：不悄悄丢弃失败尝试，让模型看到自己错在哪
             convo.append({"role": "assistant", "content": raw})
             convo.append({

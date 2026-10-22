@@ -41,7 +41,7 @@ from app.interview.prompts import (
     SUMMARY_PROMPT,
 )
 from app.interview.schemas import EvaluationResult, NextAction, QAItem
-from app.interview.tools import TOOLS, execute_tool
+from app.interview.tools import TOOLS, execute_tool, extract_text_tool_calls
 from app.security import sanitize_answer
 
 # 检查点数据库：LangGraph 每个步骤都会把状态快照写进这个文件
@@ -144,22 +144,47 @@ def generate_question(state: InterviewGraphState) -> dict:
     question = ""
     for _ in range(MAX_TOOL_ROUNDS):
         message = llm.chat_with_tools(messages, tools=TOOLS, temperature=0.8)
-        if not message.tool_calls:
-            # 模型不再要工具了：message.content 就是最终问题
-            question = (message.content or "").strip()
-            break
-        # 协议要求：先把 assistant 的 tool_calls 消息入列，再回填对应结果
-        messages.append(message)
-        for call in message.tool_calls:
-            # print 是教学期的轨迹观察手段，M10 会换成正式的轨迹记录
-            print(f"[面试官·工具调用] {call.function.name}({call.function.arguments})")
-            result = execute_tool(call.function.name, call.function.arguments)
-            print(f"[面试官·工具结果] {result[:200]}")
+        if message.tool_calls:
+            # 标准路径：模型返回了结构化 tool_calls，按协议回填
+            # 协议要求：先把 assistant 的 tool_calls 消息入列，再回填对应结果
+            messages.append(message)
+            for call in message.tool_calls:
+                # print 是教学期的轨迹观察手段，M10 会换成正式的轨迹记录
+                print(f"[面试官·工具调用] {call.function.name}({call.function.arguments})")
+                result = execute_tool(call.function.name, call.function.arguments)
+                print(f"[面试官·工具结果] {result[:200]}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,  # 结果必须与请求一一对应
+                    "content": result,
+                })
+            continue
+        content = (message.content or "").strip()
+        fake_calls = extract_text_tool_calls(content)
+        if fake_calls:
+            # M9 场景③：DeepSeek 偶发把 <tool_call> 按训练模板格式写进正文，
+            # 兼容层解析不出 tool_calls（M3-b 伏笔兑现）——解析后代为执行，
+            # 结果以 user 消息回填（不伪造 role=tool 消息，避免协议校验失败）
+            messages.append(message)
+            observed = []
+            for call in fake_calls:
+                print(f"[面试官·文本伪装工具调用→已接管] {call['name']}({call['arguments']})")
+                result = execute_tool(call["name"], call["arguments"])
+                print(f"[面试官·工具结果] {result[:200]}")
+                observed.append(f"{call['name']}({call['arguments']}) → {result}")
             messages.append({
-                "role": "tool",
-                "tool_call_id": call.id,  # 结果必须与请求一一对应
-                "content": result,
+                "role": "user",
+                "content": (
+                    "系统提示：检测到你把工具调用写在正文 <tool_call> 标签里，"
+                    "本接口只认标准 tool_calls 字段。已代为执行，结果如下：\n"
+                    + "\n".join(observed)
+                    + "\n请基于以上结果继续；若已能出题，只输出问题本身。"
+                ),
             })
+            continue
+        # 既无 tool_calls 也无伪装调用：message.content 就是最终问题
+        question = content
+        break
     if not question:
         # 兜底：达到工具轮数上限仍没拿到最终问题，撤掉工具声明直接要答案
         # 注意 M5 后 messages[0] 是 system 人设，必须保留 [:2] 再撤工具
