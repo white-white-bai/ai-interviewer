@@ -6,12 +6,16 @@ M1 的痛点 → M2 的解法：
 - 没有"停在这里等外部输入"的机制 → interrupt() 官方人工介入点
 
 图的拓扑（一次完整面试的执行轨迹）：
-START → generate_question（出题）
+START → plan_topic（M5：规划官决定下一个考察方向）
+      → generate_question（M5：面试官按规划指令定向出题）
       → ask_candidate（interrupt 暂停，等候选人提交答案）
-      → evaluate（评估打分）
+      → evaluate（M5：评估官独立人设打分）
       → manage_memory（M4：滑窗外的早期问答滚动压缩进摘要）
-      → 条件边：followup/next → 回到 generate_question（循环）
+      → 条件边：followup/next → 回到 plan_topic（循环）
                finish        → summarize → END
+
+三个 Agent（规划官/面试官/评估官）不互相喊话，
+通过共享 state 的 directive 字段传递结构化消息。
 """
 
 import operator
@@ -25,6 +29,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from app import llm
+from app.interview import agents
 from app.interview.memory import format_memory, manage_memory
 from app.interview.prompts import (
     EVALUATE_PROMPT,
@@ -66,6 +71,8 @@ class InterviewGraphState(TypedDict):
     # M4 记忆字段：摘要 + 进度水位线（前 memory_upto 轮已并入摘要）
     memory_summary: str | None
     memory_upto: int
+    # M5 多 Agent 字段：规划官写给面试官的定向出题指令（PlannerDirective 字典）
+    directive: dict | None
 
 
 def _format_history(history: list[dict]) -> str:
@@ -86,22 +93,46 @@ def _format_history(history: list[dict]) -> str:
 MAX_TOOL_ROUNDS = 3
 
 
-def generate_question(state: InterviewGraphState) -> dict:
-    """出题节点（M3-b 升级为 Agent 循环）：LLM 可先查题库再出题
+def plan_topic(state: InterviewGraphState) -> dict:
+    """考察规划节点（M5 新增）：多 Agent 协作的第一环
 
-    Agent 循环（function calling 标准套路）：
+    规划官读记忆文本（摘要+滑窗），决定下一个考察知识点，
+    结果经 Pydantic 校验后写入 state["directive"]——
+    Agent 之间不直接对话，图的共享状态就是协作介质。
+    """
+    directive = agents.plan_next_topic(state)
+    print(f"[规划官] 下一考点：{directive.topic}（{directive.guidance}）")
+    return {"directive": directive.model_dump()}
+
+
+def generate_question(state: InterviewGraphState) -> dict:
+    """出题节点（M5 升级为面试官 Agent）：按规划官指令定向出题
+
+    Agent 循环（function calling 标准套路，M3-b）：
     1. 工具声明随消息发给模型
     2. 模型要么直接给出问题文本（循环结束），要么返回 tool_calls
     3. 执行工具，结果以 role=tool 消息回填，回到第 1 步
 
+    M5 变化：messages[0] 换成面试官角色的 system prompt，
+    user 消息里注入规划官的 directive——出题从"自由发挥"变"按计划执行"。
+
     出题用高温度（0.8），鼓励发散覆盖更多知识点。
     """
+    directive = state.get("directive") or {}
+    directive_text = (
+        f"知识点：{directive.get('topic', '自由选择')}；"
+        f"指令：{directive.get('guidance', '无')}"
+    )
     user_content = QUESTION_WITH_TOOLS_PROMPT.format(
         position=state["position"],
         candidate_name=state["candidate_name"],
+        directive=directive_text,
         memory_text=format_memory(state),
     )
-    messages: list = [{"role": "user", "content": user_content}]
+    messages: list = [
+        {"role": "system", "content": agents.INTERVIEWER_SYSTEM.format(position=state["position"])},
+        {"role": "user", "content": user_content},
+    ]
     question = ""
     for _ in range(MAX_TOOL_ROUNDS):
         message = llm.chat_with_tools(messages, tools=TOOLS, temperature=0.8)
@@ -113,9 +144,9 @@ def generate_question(state: InterviewGraphState) -> dict:
         messages.append(message)
         for call in message.tool_calls:
             # print 是教学期的轨迹观察手段，M10 会换成正式的轨迹记录
-            print(f"[工具调用] {call.function.name}({call.function.arguments})")
+            print(f"[面试官·工具调用] {call.function.name}({call.function.arguments})")
             result = execute_tool(call.function.name, call.function.arguments)
-            print(f"[工具结果] {result[:200]}")
+            print(f"[面试官·工具结果] {result[:200]}")
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.id,  # 结果必须与请求一一对应
@@ -123,7 +154,8 @@ def generate_question(state: InterviewGraphState) -> dict:
             })
     if not question:
         # 兜底：达到工具轮数上限仍没拿到最终问题，撤掉工具声明直接要答案
-        question = llm.chat(messages=[messages[0]], temperature=0.8).strip()
+        # 注意 M5 后 messages[0] 是 system 人设，必须保留 [:2] 再撤工具
+        question = llm.chat(messages=messages[:2], temperature=0.8).strip()
     return {
         "current_question": question,
         "round_count": state.get("round_count", 0) + 1,
@@ -143,16 +175,23 @@ def ask_candidate(state: InterviewGraphState) -> dict:
 
 
 def evaluate(state: InterviewGraphState) -> dict:
-    """评估节点：低温度（0.2）打分 + Pydantic 结构化校验 + 记录本轮问答"""
+    """评估节点（M5 升级为评估官 Agent）：低温度（0.2）打分 + Pydantic 结构化校验 + 记录本轮问答
+
+    评估官有独立的 system 人设（agents.EVALUATOR_SYSTEM），
+    与出题的面试官分离——避免"出题者自己评估自己"的角色混淆。
+    """
     raw = llm.chat(
-        messages=[{
-            "role": "user",
-            "content": EVALUATE_PROMPT.format(
-                position=state["position"],
-                question=state["current_question"],
-                answer=state["last_answer"],
-            ),
-        }],
+        messages=[
+            {"role": "system", "content": agents.EVALUATOR_SYSTEM},
+            {
+                "role": "user",
+                "content": EVALUATE_PROMPT.format(
+                    position=state["position"],
+                    question=state["current_question"],
+                    answer=state["last_answer"],
+                ),
+            },
+        ],
         temperature=0.2,
     )
     result = EvaluationResult.model_validate_json(_clean_json(raw))
@@ -206,22 +245,24 @@ def build_interview_graph():
     add_conditional_edges 是"看状态选路"（等价于 M1 里的 if/else 分支）。
     """
     builder = StateGraph(InterviewGraphState)
+    builder.add_node("plan_topic", plan_topic)  # M5：规划官 Agent
     builder.add_node("generate_question", generate_question)
     builder.add_node("ask_candidate", ask_candidate)
     builder.add_node("evaluate", evaluate)
     builder.add_node("manage_memory", manage_memory)  # M4：记忆管理节点
     builder.add_node("summarize", summarize)
 
-    builder.add_edge(START, "generate_question")
+    builder.add_edge(START, "plan_topic")
+    builder.add_edge("plan_topic", "generate_question")
     builder.add_edge("generate_question", "ask_candidate")
     builder.add_edge("ask_candidate", "evaluate")
     builder.add_edge("evaluate", "manage_memory")
     # 条件边从 manage_memory 挂出：history 已更新完毕，摘要也已滚动，
-    # 之后的分流（followup/next/finish）基于"压缩后"的最新状态做决策
+    # followup/next 都回到规划官——每一道新题都先经规划再出题
     builder.add_conditional_edges(
         "manage_memory",
         route_after_evaluate,
-        {"followup": "generate_question", "next": "generate_question", "finish": "summarize"},
+        {"followup": "plan_topic", "next": "plan_topic", "finish": "summarize"},
     )
     builder.add_edge("summarize", END)
     # compile 时挂上 checkpointer：之后每一步自动写档，支持暂停/恢复/读档

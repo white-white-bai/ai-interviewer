@@ -34,6 +34,17 @@ class EvaluationResult(BaseModel):
     action: NextAction = Field(description="下一步动作")
 
 
+class PlannerDirective(BaseModel):
+    """考察规划官的结构化输出（M5 多 Agent 协作的"消息协议"）
+
+    规划官把决策写进这个结构 → 图存入 state["directive"] → 出题 Agent 读取：
+    多 Agent 之间不直接对话，通过共享状态的字段传递消息。
+    """
+
+    topic: str = Field(description="下一个考察的知识点")
+    guidance: str = Field(description="给面试官的一句话出题指令，如：围绕生成器在异常时的行为深入追问")
+
+
 class InterviewSession(BaseModel):
     """一场面试会话的完整状态（M1 内存存储，M3 持久化到 SQLite）"""
 
