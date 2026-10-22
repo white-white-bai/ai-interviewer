@@ -1,6 +1,10 @@
 from fastapi import FastAPI
 
+from app.db import init_db
 from app.routers import interview, interview_graph, questions
+
+# 启动时初始化业务数据库：建表 + 空表写入种子数据（幂等，可重复执行）
+init_db()
 
 # 创建 FastAPI 应用实例
 # title/description/version 会展示在自动生成的文档页面上

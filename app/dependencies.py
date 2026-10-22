@@ -1,7 +1,7 @@
 from fastapi import HTTPException, Query
 
+from app import storage
 from app.models import Question
-from app.storage import fake_questions
 
 
 def get_question_or_404(question_id: int) -> Question:
@@ -9,11 +9,12 @@ def get_question_or_404(question_id: int) -> Question:
 
     依赖函数的参数同样由 FastAPI 自动解析——question_id
     会自动从路径参数 {question_id} 注入，无需手动传值。
+    M3 变化：查找逻辑委托给 storage 仓储层（SQL 查询而非遍历内存列表）。
     """
-    for q in fake_questions:
-        if q.id == question_id:
-            return q
-    raise HTTPException(status_code=404, detail=f"题目 {question_id} 不存在")
+    question = storage.get_question(question_id)
+    if question is None:
+        raise HTTPException(status_code=404, detail=f"题目 {question_id} 不存在")
+    return question
 
 
 def pagination_params(
