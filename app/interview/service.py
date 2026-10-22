@@ -27,17 +27,9 @@ def _format_history(session: InterviewSession) -> str:
     return "\n".join(lines)
 
 
-def _clean_json(text: str) -> str:
-    """清洗 LLM 输出：去掉 markdown 代码围栏，得到纯 JSON 文本
-
-    模型常无视指令输出 ```json ... ``` 围栏，这里做兜底清洗；
-    更健壮的重试机制在 M9（自我纠错）实现。
-    """
-    text = text.strip()
-    if text.startswith("```"):
-        # 去掉首行（```json）与结尾的 ``` 围栏
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-    return text.strip()
+# _clean_json 已上移至 app/llm.py（M9 的结构化输出重试同样在那一层实现），
+# 这里保留同名 re-export，兼容 graph.py / agents.py 的旧 import 路径
+from app.llm import _clean_json  # noqa: E402,F401
 
 
 def start_interview(candidate_name: str, position: str) -> InterviewSession:

@@ -43,7 +43,6 @@ from app.interview.prompts import (
 from app.interview.schemas import EvaluationResult, NextAction, QAItem
 from app.interview.tools import TOOLS, execute_tool
 from app.security import sanitize_answer
-from app.interview.service import _clean_json
 
 # 检查点数据库：LangGraph 每个步骤都会把状态快照写进这个文件
 # 注意：这是 LangGraph 自己的"存档库"，与 M3 要做的业务数据库是两回事
@@ -221,6 +220,8 @@ def evaluate(state: InterviewGraphState) -> dict:
     M7：候选人回答是不可信的外部数据，注入提示词前先过 sanitize_answer
     （截断 + 数据/指令分离标记）；history 里存的仍是原始回答——
     延续 M4 的"无损存储、有损注入"原则。
+    M9：解析交给 chat_structured——评估官偶发输出坏 JSON 时自动回填
+    错误重试，不再让 evaluate 节点直接崩溃。
     """
     # M7：清洗不可信回答，评估输入用的是带数据标记的版本
     safe_answer = sanitize_answer(state["last_answer"])
@@ -230,7 +231,7 @@ def evaluate(state: InterviewGraphState) -> dict:
             f"【沙箱实测】候选人代码块的真实运行结果（以此为准，不要凭记忆猜测代码输出）：\n"
             f"{state['code_result']}"
         )
-    raw = llm.chat(
+    result = llm.chat_structured(
         messages=[
             {"role": "system", "content": agents.EVALUATOR_SYSTEM},
             {
@@ -242,9 +243,9 @@ def evaluate(state: InterviewGraphState) -> dict:
                 ),
             },
         ],
+        model_cls=EvaluationResult,
         temperature=0.2,
     )
-    result = EvaluationResult.model_validate_json(_clean_json(raw))
     qa = QAItem(
         question=state["current_question"],
         answer=state["last_answer"],

@@ -15,7 +15,6 @@ from app import llm
 from app.interview.memory import format_memory
 from app.interview.prompts import PLANNER_PROMPT
 from app.interview.schemas import PlannerDirective
-from app.interview.service import _clean_json
 
 # 三个角色的 system prompt：人设分离是多 Agent 的第一特征
 PLANNER_SYSTEM = """你是技术面试的考察规划官。你不出题、不评分，只负责根据面试记忆决定下一个考察知识点，平衡覆盖面与针对性。"""
@@ -33,11 +32,13 @@ def plan_next_topic(state: dict) -> PlannerDirective:
 
     输出经 Pydantic 校验的 PlannerDirective，由图写入 state["directive"]
     传给出题 Agent——这就是多 Agent 之间的"消息协议"。
+    M9：解析交给 chat_structured——模型偶发输出坏 JSON 时自动回填错误重试，
+    不再让 plan_topic 节点直接崩溃（M8 验证时实际发生过）。
 
     Args:
         state: 图的共享状态（至少含 position、history、memory_* 字段）
     """
-    raw = llm.chat(
+    return llm.chat_structured(
         messages=[
             {"role": "system", "content": PLANNER_SYSTEM},
             {
@@ -48,6 +49,6 @@ def plan_next_topic(state: dict) -> PlannerDirective:
                 ),
             },
         ],
+        model_cls=PlannerDirective,
         temperature=0.3,  # 规划要稳定，不要发散
     )
-    return PlannerDirective.model_validate_json(_clean_json(raw))

@@ -22,7 +22,7 @@ EVALUATE_PROMPT = """你是「{position}」岗位的技术面试官。请评估�
 }}
 判定规则：
 - score < 5 或回答明显不完整 → action = followup
-- 候选人整体表现出色且已考察 2 题以上 → action = finish
+- 已考察 3 题以上且候选人无重大知识缺陷 → action = finish（面试时长有限，应及时收尾，不要无限追问）
 - 其余情况 → action = next"""
 
 # 面试总结提示词（M2 新增：LangGraph 图中 finish 分支的收尾节点使用）
