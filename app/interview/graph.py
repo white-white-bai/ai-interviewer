@@ -19,6 +19,7 @@ START → plan_topic（M5：规划官决定下一个考察方向）
 """
 
 import operator
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from app import llm
+from app import llm, sandbox
 from app.interview import agents
 from app.interview.memory import format_memory, manage_memory
 from app.interview.prompts import (
@@ -73,6 +74,8 @@ class InterviewGraphState(TypedDict):
     memory_upto: int
     # M5 多 Agent 字段：规划官写给面试官的定向出题指令（PlannerDirective 字典）
     directive: dict | None
+    # M6 沙箱字段：候选人代码块的真实运行结果（本轮没有代码块则为 None）
+    code_result: str | None
 
 
 def _format_history(history: list[dict]) -> str:
@@ -174,12 +177,49 @@ def ask_candidate(state: InterviewGraphState) -> dict:
     return {"last_answer": answer}
 
 
+# 代码块提取：匹配 ```python ... ``` 或无语言标注的 ``` ... ```（DOTALL 跨行）
+_CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+
+
+def run_code(state: InterviewGraphState) -> dict:
+    """代码沙箱节点（M6 新增）：候选人回答里的代码块真正跑一遍
+
+    Agent 决策依据的升级：评估官不再猜"这段代码能不能跑"，
+    而是拿到真实运行结果（输出/报错/超时）再打分——
+    LLM 心算运行结果经常出错，沙箱给的是事实。
+
+    本轮回答没有代码块时显式把 code_result 置回 None：
+    该字段留在 state 里会跨轮残留，必须每轮清理。
+    """
+    answer = state.get("last_answer") or ""
+    matches = list(_CODE_BLOCK_RE.finditer(answer))
+    if not matches:
+        return {"code_result": None}  # 无代码块：清理旧值并空转通过
+    # 取最后一个代码块：候选人常先用小片段讲解，最终答案代码通常放在最后
+    code = matches[-1].group(1)
+    print(f"[沙箱] 检测到 {len(matches)} 个代码块，执行最后一个（超时 {sandbox.DEFAULT_TIMEOUT} 秒）...")
+    result = sandbox.run_python(code)
+    label = "成功" if result["ok"] else ("超时强杀" if result["timed_out"] else "报错")
+    preview = (result["stdout"] or result["stderr"]).strip()[:120]
+    print(f"[沙箱] 执行{label}：{preview}")
+    return {"code_result": sandbox.format_result(result)}
+
+
 def evaluate(state: InterviewGraphState) -> dict:
     """评估节点（M5 升级为评估官 Agent）：低温度（0.2）打分 + Pydantic 结构化校验 + 记录本轮问答
 
     评估官有独立的 system 人设（agents.EVALUATOR_SYSTEM），
     与出题的面试官分离——避免"出题者自己评估自己"的角色混淆。
+    M6：若沙箱跑出了真实运行结果，作为证据追加进评估输入——
+    不改共享的 EVALUATE_PROMPT 模板（M1 的 service 也在用它）。
     """
+    answer = state["last_answer"]
+    if state.get("code_result"):
+        answer = (
+            f"{answer}\n\n"
+            f"【沙箱实测】候选人代码块的真实运行结果（以此为准，不要凭记忆猜测代码输出）：\n"
+            f"{state['code_result']}"
+        )
     raw = llm.chat(
         messages=[
             {"role": "system", "content": agents.EVALUATOR_SYSTEM},
@@ -248,6 +288,7 @@ def build_interview_graph():
     builder.add_node("plan_topic", plan_topic)  # M5：规划官 Agent
     builder.add_node("generate_question", generate_question)
     builder.add_node("ask_candidate", ask_candidate)
+    builder.add_node("run_code", run_code)  # M6：代码沙箱节点
     builder.add_node("evaluate", evaluate)
     builder.add_node("manage_memory", manage_memory)  # M4：记忆管理节点
     builder.add_node("summarize", summarize)
@@ -255,7 +296,8 @@ def build_interview_graph():
     builder.add_edge(START, "plan_topic")
     builder.add_edge("plan_topic", "generate_question")
     builder.add_edge("generate_question", "ask_candidate")
-    builder.add_edge("ask_candidate", "evaluate")
+    builder.add_edge("ask_candidate", "run_code")
+    builder.add_edge("run_code", "evaluate")
     builder.add_edge("evaluate", "manage_memory")
     # 条件边从 manage_memory 挂出：history 已更新完毕，摘要也已滚动，
     # followup/next 都回到规划官——每一道新题都先经规划再出题
